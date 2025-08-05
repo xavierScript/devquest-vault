@@ -1,7 +1,7 @@
 
 use anchor_lang::{prelude::*, system_program::{Transfer, transfer}};
 
-declare_id!("DnQBHsS7uRgtxXAb5FHQdfmZCKf3mp9VgvNWotK5BK7L");
+declare_id!("8GXzdcCDdBr7MaLwAULrxG1KBYB5yjVVva2cs8cemoRb");
 
 #[program]
 pub mod devquest_vault {
