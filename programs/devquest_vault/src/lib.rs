@@ -18,6 +18,14 @@ pub enum CustomError {
     PayeeNotFound,
     #[msg("Only authorized payees can withdraw")]
     UnauthorizedPayee,
+    #[msg("Invalid payout schedule")]
+    InvalidPayoutSchedule,
+    #[msg("Maximum number of payout schedules reached")]
+    MaxSchedulesReached,
+    #[msg("Payout schedule not found")]
+    ScheduleNotFound,
+    #[msg("Payout time not reached")]
+    PayoutTimeNotReached,
 }
 
 #[program]
@@ -50,6 +58,29 @@ pub mod devquest_vault {
     pub fn close(ctx: Context<Close>) -> Result<()> {
         ctx.accounts.close()?;
         Ok(())
+    }
+
+    pub fn schedule_payout(
+        ctx: Context<UpdatePayee>,
+        payee: Pubkey,
+        amount: u64,
+        start_time: i64,
+        interval: i64,
+    ) -> Result<()> {
+        ctx.accounts.schedule_payout(payee, amount, start_time, interval)
+    }
+
+    pub fn cancel_payout(
+        ctx: Context<UpdatePayee>,
+        payee: Pubkey,
+    ) -> Result<()> {
+        ctx.accounts.cancel_payout(payee)
+    }
+
+    pub fn claim_payout(
+        ctx: Context<Withdraw>,
+    ) -> Result<()> {
+        ctx.accounts.claim_payout()
     }
 }
 #[derive(Accounts)]
@@ -185,6 +216,53 @@ impl<'info> Withdraw<'info> {
 
         Ok(())
     }
+
+    pub fn claim_payout(&mut self) -> Result<()> {
+        let user_key = self.user.key();
+        require!(self.vault_state.payees.contains(&user_key), CustomError::UnauthorizedPayee);
+
+        let current_time = Clock::get()?.unix_timestamp;
+        
+        // Find the active schedule and get its index
+        let schedule_index = self.vault_state.payout_schedules
+            .iter()
+            .position(|s| s.is_active)
+            .ok_or(error!(CustomError::ScheduleNotFound))?;
+
+        // Check if it's time for payout
+        let schedule = &self.vault_state.payout_schedules[schedule_index];
+        require!(current_time >= schedule.next_payout_time, CustomError::PayoutTimeNotReached);
+
+        // Get the amount to transfer
+        let amount = schedule.amount;
+
+        // Transfer the scheduled amount
+        let cpi_program = self.system_program.to_account_info();
+        let cpi_accounts = Transfer {
+            from: self.vault.to_account_info(),
+            to: self.user.to_account_info(),
+        };
+
+        let vault_state_key = self.vault_state.to_account_info().key;
+        let vault_bump = self.vault_state.vault_bump;
+
+        let seeds = &[
+            b"vault",
+            vault_state_key.as_ref(),
+            &[vault_bump],
+        ];
+
+        let signer_seeds = &[&seeds[..]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
+
+        transfer(cpi_ctx, amount)?;
+
+        // Update next payout time after successful transfer
+        self.vault_state.payout_schedules[schedule_index].next_payout_time += 
+            self.vault_state.payout_schedules[schedule_index].interval;
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -232,18 +310,30 @@ impl<'info> Close<'info> {
         Ok(())
     }
 }
+#[derive(AnchorDeserialize, AnchorSerialize, Clone, Default)]
+pub struct PayoutSchedule {
+    pub amount: u64,                 // Amount to be paid
+    pub next_payout_time: i64,       // Timestamp for next payout
+    pub interval: i64,               // Time between payouts (in seconds)
+    pub is_active: bool,             // Whether this schedule is active
+}
+
 #[account]
 pub struct VaultState {
     pub vault_bump: u8,
     pub state_bump: u8,
     pub admin: Pubkey,
     pub payees: Vec<Pubkey>,         // List of authorized payees
+    pub payout_schedules: Vec<PayoutSchedule>,  // Scheduled payouts for each payee
     pub is_initialized: bool,
 }
 
 impl Space for VaultState {
-    // 8 discriminator + 1 vault_bump + 1 state_bump + 32 admin + 4 vec length + (32 * 5) max payees + 1 is_initialized
-    const INIT_SPACE: usize = 8 + 1 + 1 + 32 + 4 + (32 * 5) + 1;
+    // 8 discriminator + 1 vault_bump + 1 state_bump + 32 admin + 
+    // 4 vec length + (32 * 5) max payees + 
+    // 4 vec length + (8 + 8 + 8 + 1) * 5 max schedules + 
+    // 1 is_initialized
+    const INIT_SPACE: usize = 8 + 1 + 1 + 32 + 4 + (32 * 5) + 4 + (25 * 5) + 1;
 }
 
 #[derive(Accounts)]
@@ -271,9 +361,53 @@ impl<'info> UpdatePayee<'info> {
     pub fn remove_payee(&mut self, payee: Pubkey) -> Result<()> {
         if let Some(index) = self.vault_state.payees.iter().position(|x| *x == payee) {
             self.vault_state.payees.remove(index);
+            // Also remove any associated payout schedule
+            let schedule_index = self.vault_state.payout_schedules
+                .iter()
+                .position(|s| s.is_active);
+            
+            if let Some(idx) = schedule_index {
+                self.vault_state.payout_schedules.remove(idx);
+            }
             Ok(())
         } else {
             err!(CustomError::PayeeNotFound)
+        }
+    }
+
+    pub fn schedule_payout(
+        &mut self,
+        payee: Pubkey,
+        amount: u64,
+        start_time: i64,
+        interval: i64,
+    ) -> Result<()> {
+        // Validate inputs
+        require!(amount > 0, CustomError::InvalidPayoutSchedule);
+        require!(interval > 0, CustomError::InvalidPayoutSchedule);
+        require!(start_time > Clock::get()?.unix_timestamp, CustomError::InvalidPayoutSchedule);
+        require!(self.vault_state.payees.contains(&payee), CustomError::PayeeNotFound);
+        require!(self.vault_state.payout_schedules.len() < 5, CustomError::MaxSchedulesReached);
+
+        let schedule = PayoutSchedule {
+            amount,
+            next_payout_time: start_time,
+            interval,
+            is_active: true,
+        };
+
+        self.vault_state.payout_schedules.push(schedule);
+        Ok(())
+    }
+
+    pub fn cancel_payout(&mut self, payee: Pubkey) -> Result<()> {
+        require!(self.vault_state.payees.contains(&payee), CustomError::PayeeNotFound);
+        
+        if let Some(schedule_index) = self.vault_state.payout_schedules.iter().position(|_| true) {
+            self.vault_state.payout_schedules[schedule_index].is_active = false;
+            Ok(())
+        } else {
+            err!(CustomError::ScheduleNotFound)
         }
     }
 }

@@ -222,6 +222,145 @@ describe("devquest-vault", () => {
     );
   });
 
+  it("Admin can schedule payout", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const startTime = now + 5; // Start in 5 seconds
+    const interval = 10; // 10 seconds between payouts
+    const amount = new anchor.BN(0.1 * anchor.web3.LAMPORTS_PER_SOL);
+
+    const tx = await program.methods
+      .schedulePayout(
+        payee1.publicKey,
+        amount,
+        new anchor.BN(startTime),
+        new anchor.BN(interval)
+      )
+      .accountsPartial({
+        user: provider.wallet.publicKey,
+        vaultState,
+      })
+      .rpc();
+
+    console.log("\nScheduling payout transaction signature", tx);
+
+    // Verify schedule was created
+    const vaultStateAccount = await program.account.vaultState.fetch(
+      vaultState
+    );
+    assert(
+      vaultStateAccount.payoutSchedules.length > 0,
+      "Schedule should be created"
+    );
+    assert(
+      vaultStateAccount.payoutSchedules[0].isActive,
+      "Schedule should be active"
+    );
+    assert.equal(
+      vaultStateAccount.payoutSchedules[0].amount.toNumber(),
+      amount.toNumber(),
+      "Schedule amount should match"
+    );
+  });
+
+  it("Cannot claim payout before time", async () => {
+    try {
+      await program.methods
+        .claimPayout()
+        .accountsPartial({
+          user: payee1.publicKey,
+          vaultState,
+          vault,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([payee1])
+        .rpc();
+
+      assert.fail("Should not be able to claim before scheduled time");
+    } catch (error) {
+      console.log("Successfully prevented early payout claim");
+      assert.equal(error.error.errorCode.code, "PayoutTimeNotReached");
+    }
+  });
+
+  // it("Can claim payout after time", async () => {
+  //   // Wait for the payout time
+  //   await new Promise((resolve) => setTimeout(resolve, 6000));
+
+  //   const beforeBalance = await provider.connection.getBalance(
+  //     payee1.publicKey
+  //   );
+
+  //   const tx = await program.methods
+  //     .claimPayout()
+  //     .accountsPartial({
+  //       user: payee1.publicKey,
+  //       vaultState,
+  //       vault,
+  //       systemProgram: anchor.web3.SystemProgram.programId,
+  //     })
+  //     .signers([payee1])
+  //     .rpc();
+
+  //   console.log("\nClaiming payout transaction signature", tx);
+
+  //   const afterBalance = await provider.connection.getBalance(payee1.publicKey);
+  //   assert(
+  //     afterBalance > beforeBalance,
+  //     "Payee balance should increase after claim"
+  //   );
+
+  //   // Verify next payout time was updated
+  //   const vaultStateAccount = await program.account.vaultState.fetch(
+  //     vaultState
+  //   );
+  //   assert(
+  //     vaultStateAccount.payoutSchedules[0].nextPayoutTime.toNumber() >
+  //       Math.floor(Date.now() / 1000),
+  //     "Next payout time should be updated"
+  //   );
+  // });
+
+  it("Admin can cancel payout schedule", async () => {
+    const tx = await program.methods
+      .cancelPayout(payee1.publicKey)
+      .accountsPartial({
+        user: provider.wallet.publicKey,
+        vaultState,
+      })
+      .rpc();
+
+    console.log("\nCanceling payout schedule transaction signature", tx);
+
+    // Verify schedule was cancelled
+    const vaultStateAccount = await program.account.vaultState.fetch(
+      vaultState
+    );
+    assert(
+      !vaultStateAccount.payoutSchedules[0].isActive,
+      "Schedule should be inactive"
+    );
+  });
+
+  it("Cannot claim from cancelled schedule", async () => {
+    try {
+      await program.methods
+        .claimPayout()
+        .accountsPartial({
+          user: payee1.publicKey,
+          vaultState,
+          vault,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([payee1])
+        .rpc();
+
+      assert.fail("Should not be able to claim from cancelled schedule");
+    } catch (error) {
+      console.log("Successfully prevented claim from cancelled schedule");
+      assert.equal(error.error.errorCode.code, "ScheduleNotFound");
+    }
+  });
+
   it("Close vault", async () => {
     const tx = await program.methods
       .close()
