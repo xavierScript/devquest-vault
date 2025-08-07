@@ -26,6 +26,10 @@ pub enum CustomError {
     ScheduleNotFound,
     #[msg("Payout time not reached")]
     PayoutTimeNotReached,
+    #[msg("Epoch spending limit reached")]
+    EpochSpendingLimitReached,
+    #[msg("Invalid epoch configuration")]
+    InvalidEpochConfig,
 }
 
 #[program]
@@ -47,6 +51,48 @@ pub mod devquest_vault {
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         ctx.accounts.deposit(amount)?;
+        Ok(())
+    }
+
+    pub fn set_epoch_limit(
+        ctx: Context<UpdatePayee>,
+        payee: Pubkey,
+        limit: u64,
+        duration: i64
+    ) -> Result<()> {
+        require!(duration > 0, CustomError::InvalidEpochConfig);
+        require!(limit > 0, CustomError::InvalidEpochConfig);
+
+        let state = &mut ctx.accounts.vault_state;
+        
+        // Only admin can set limits
+        require!(ctx.accounts.user.key() == state.admin, CustomError::UnauthorizedAdmin);
+        
+        // Check if payee exists
+        require!(state.payees.contains(&payee), CustomError::PayeeNotFound);
+        
+        let now = Clock::get()?.unix_timestamp;
+        
+        // Find existing epoch limit or create new one
+        if let Some(index) = state.epoch_limits.iter().position(|(p, _)| p == &payee) {
+            state.epoch_limits[index].1 = EpochSpending {
+                epoch_start: now,
+                spent_amount: 0,
+                limit,
+                duration,
+            };
+        } else {
+            state.epoch_limits.push((
+                payee,
+                EpochSpending {
+                    epoch_start: now,
+                    spent_amount: 0,
+                    limit,
+                    duration,
+                }
+            ));
+        }
+        
         Ok(())
     }
 
@@ -188,28 +234,54 @@ pub struct Withdraw<'info> {
 
 impl<'info> Withdraw<'info> {
     pub fn withdraw(&mut self, amount: u64) -> Result<()> {
-        // Check if the user is either admin or an authorized payee
-        let user_key = self.user.key();
-        require!(
-            user_key == self.vault_state.admin || self.vault_state.payees.contains(&user_key),
-            CustomError::UnauthorizedPayee
-        );
+        // Check if user is admin or authorized payee
+        if self.user.key() != self.vault_state.admin &&
+           !self.vault_state.payees.contains(&self.user.key()) {
+            return err!(CustomError::UnauthorizedPayee);
+        }
 
+        // If user is not admin, check epoch limits
+        if self.user.key() != self.vault_state.admin {
+            let now = Clock::get()?.unix_timestamp;
+            
+            if let Some((_, epoch_spending)) = self.vault_state.epoch_limits
+                .iter_mut()
+                .find(|(p, _)| p == &self.user.key())
+            {
+                // Check if we need to reset the epoch
+                if now >= epoch_spending.epoch_start + epoch_spending.duration {
+                    // New epoch starts
+                    epoch_spending.epoch_start = now;
+                    epoch_spending.spent_amount = 0;
+                }
+                
+                // Check if this withdrawal would exceed the limit
+                if epoch_spending.spent_amount + amount > epoch_spending.limit {
+                    return err!(CustomError::EpochSpendingLimitReached);
+                }
+                
+                // Update spent amount
+                epoch_spending.spent_amount += amount;
+            }
+        }
+
+        // Perform the withdrawal
         let cpi_program = self.system_program.to_account_info();
-
         let cpi_accounts = Transfer {
             from: self.vault.to_account_info(),
             to: self.user.to_account_info(),
         };
 
+        let vault_state_key = self.vault_state.to_account_info().key;
+        let vault_bump = self.vault_state.vault_bump;
+
         let seeds = &[
             b"vault",
-            self.vault_state.to_account_info().key.as_ref(),
-            &[self.vault_state.vault_bump],
+            vault_state_key.as_ref(),
+            &[vault_bump],
         ];
 
         let signer_seeds = &[&seeds[..]];
-
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
 
         transfer(cpi_ctx, amount)?;
@@ -318,6 +390,14 @@ pub struct PayoutSchedule {
     pub is_active: bool,             // Whether this schedule is active
 }
 
+#[derive(AnchorDeserialize, AnchorSerialize, Clone, Default)]
+pub struct EpochSpending {
+    pub epoch_start: i64,            // Start time of current epoch
+    pub spent_amount: u64,           // Amount spent in current epoch
+    pub limit: u64,                  // Maximum amount that can be spent in an epoch
+    pub duration: i64,               // Duration of epoch in seconds (e.g., 86400 for daily)
+}
+
 #[account]
 pub struct VaultState {
     pub vault_bump: u8,
@@ -325,6 +405,7 @@ pub struct VaultState {
     pub admin: Pubkey,
     pub payees: Vec<Pubkey>,         // List of authorized payees
     pub payout_schedules: Vec<PayoutSchedule>,  // Scheduled payouts for each payee
+    pub epoch_limits: Vec<(Pubkey, EpochSpending)>,  // Spending limits per payee
     pub is_initialized: bool,
 }
 
@@ -332,8 +413,9 @@ impl Space for VaultState {
     // 8 discriminator + 1 vault_bump + 1 state_bump + 32 admin + 
     // 4 vec length + (32 * 5) max payees + 
     // 4 vec length + (8 + 8 + 8 + 1) * 5 max schedules + 
+    // 4 vec length + (32 + (8 + 8 + 8 + 8)) * 5 max epoch limits +
     // 1 is_initialized
-    const INIT_SPACE: usize = 8 + 1 + 1 + 32 + 4 + (32 * 5) + 4 + (25 * 5) + 1;
+    const INIT_SPACE: usize = 8 + 1 + 1 + 32 + 4 + (32 * 5) + 4 + (25 * 5) + 4 + (64 * 5) + 1;
 }
 
 #[derive(Accounts)]
