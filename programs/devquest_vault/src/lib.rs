@@ -1,9 +1,12 @@
 
+// Import Anchor framework and system program transfer utilities
 use anchor_lang::{prelude::*, system_program::{Transfer, transfer}};
 
+// Program ID for the deployed contract
 // declare_id!("8GXzdcCDdBr7MaLwAULrxG1KBYB5yjVVva2cs8cemoRb");
 declare_id!("8b4G7EpokrxCpb1BMK5kjFMtLFnGFqLetxvR3ou17cS8");
 
+/// Custom errors for the vault program
 #[error_code]
 pub enum CustomError {
     #[msg("Vault is already initialized")]
@@ -32,28 +35,34 @@ pub enum CustomError {
     InvalidEpochConfig,
 }
 
+/// Main program module for devquest_vault
 #[program]
 pub mod devquest_vault {
     use super::*;
 
+    /// Initializes the vault and vault state accounts
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         ctx.accounts.initialize(&ctx.bumps)?;
         Ok(())
     }
 
+    /// Adds a new payee to the vault (admin only)
     pub fn add_payee(ctx: Context<UpdatePayee>, payee: Pubkey) -> Result<()> {
         ctx.accounts.add_payee(payee)
     }
 
+    /// Removes a payee from the vault (admin only)
     pub fn remove_payee(ctx: Context<UpdatePayee>, payee: Pubkey) -> Result<()> {
         ctx.accounts.remove_payee(payee)
     }
 
+    /// Deposits SOL into the vault
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         ctx.accounts.deposit(amount)?;
         Ok(())
     }
 
+    /// Sets an epoch spending limit for a payee (admin only)
     pub fn set_epoch_limit(
         ctx: Context<UpdatePayee>,
         payee: Pubkey,
@@ -64,15 +73,11 @@ pub mod devquest_vault {
         require!(limit > 0, CustomError::InvalidEpochConfig);
 
         let state = &mut ctx.accounts.vault_state;
-        
         // Only admin can set limits
         require!(ctx.accounts.user.key() == state.admin, CustomError::UnauthorizedAdmin);
-        
         // Check if payee exists
         require!(state.payees.contains(&payee), CustomError::PayeeNotFound);
-        
         let now = Clock::get()?.unix_timestamp;
-        
         // Find existing epoch limit or create new one
         if let Some(index) = state.epoch_limits.iter().position(|(p, _)| p == &payee) {
             state.epoch_limits[index].1 = EpochSpending {
@@ -92,20 +97,22 @@ pub mod devquest_vault {
                 }
             ));
         }
-        
         Ok(())
     }
 
+    /// Withdraws SOL from the vault (admin or authorized payee)
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
         ctx.accounts.withdraw(amount)?;
         Ok(())
     }
 
+    /// Closes the vault and returns remaining funds to the admin
     pub fn close(ctx: Context<Close>) -> Result<()> {
         ctx.accounts.close()?;
         Ok(())
     }
 
+    /// Schedules a recurring payout for a payee (admin only)
     pub fn schedule_payout(
         ctx: Context<UpdatePayee>,
         payee: Pubkey,
@@ -116,6 +123,7 @@ pub mod devquest_vault {
         ctx.accounts.schedule_payout(payee, amount, start_time, interval)
     }
 
+    /// Cancels a payout schedule for a payee (admin only)
     pub fn cancel_payout(
         ctx: Context<UpdatePayee>,
         payee: Pubkey,
@@ -123,16 +131,21 @@ pub mod devquest_vault {
         ctx.accounts.cancel_payout(payee)
     }
 
+    /// Allows a payee to claim their scheduled payout
     pub fn claim_payout(
         ctx: Context<Withdraw>,
     ) -> Result<()> {
         ctx.accounts.claim_payout()
     }
 }
+
+/// Accounts required for initializing the vault
 #[derive(Accounts)]
 pub struct Initialize<'info> {
+    /// The admin initializing the vault
     #[account(mut)]
     pub user: Signer<'info>,
+    /// The vault state account (PDA)
     #[account(
         init,
         payer = user,
@@ -141,6 +154,7 @@ pub struct Initialize<'info> {
         space = VaultState::INIT_SPACE,
     )]
     pub vault_state: Account<'info, VaultState>,
+    /// The vault account (PDA)
     #[account(
         mut,
         seeds = [b"vault", vault_state.key().as_ref()],
@@ -151,33 +165,30 @@ pub struct Initialize<'info> {
 }
 
 impl<'info> Initialize<'info> {
+    /// Handler for vault initialization logic
     pub fn initialize(&mut self, bumps: &InitializeBumps) -> Result<()> {
         require!(!self.vault_state.is_initialized, CustomError::AlreadyInitialized);
-        
-        // Get the amount of lamports needed to make the vault rent exempt
+        // Calculate rent-exempt minimum for the vault
         let rent_exempt = Rent::get()?.minimum_balance(self.vault.to_account_info().data_len());
-
-        // Transfer the rent-exempt amount from the user to the vault
+        // Transfer rent-exempt lamports from user to vault
         let cpi_program = self.system_program.to_account_info();
         let cpi_accounts = Transfer {
             from: self.user.to_account_info(),
             to: self.vault.to_account_info(),
         };
-
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-
         transfer(cpi_ctx, rent_exempt)?;
-
+        // Initialize vault state fields
         self.vault_state.vault_bump = bumps.vault;
         self.vault_state.state_bump = bumps.vault_state;
         self.vault_state.admin = self.user.key();
         self.vault_state.payees = Vec::new();
         self.vault_state.is_initialized = true;
-
         Ok(())
     }  
 }
 
+/// Accounts required for depositing SOL into the vault
 #[derive(Accounts)]
 pub struct Deposit<'info> {
     #[account(mut)]
@@ -197,23 +208,21 @@ pub struct Deposit<'info> {
 }
 
 impl<'info> Deposit<'info> {
+    /// Handler for deposit logic
     pub fn deposit(&mut self, amount: u64) -> Result<()> {
-
+        // Transfer lamports from user to vault
         let cpi_program = self.system_program.to_account_info();
-
         let cpi_accounts = Transfer {
             from: self.user.to_account_info(),
             to: self.vault.to_account_info(),
         };
-
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-
         transfer(cpi_ctx, amount)?;
-
         Ok(())
     }
 }
 
+/// Accounts required for withdrawing SOL from the vault
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
     #[account(mut)]
@@ -233,110 +242,90 @@ pub struct Withdraw<'info> {
 }
 
 impl<'info> Withdraw<'info> {
+    /// Handler for withdrawal logic (admin or authorized payee)
     pub fn withdraw(&mut self, amount: u64) -> Result<()> {
         // Check if user is admin or authorized payee
         if self.user.key() != self.vault_state.admin &&
            !self.vault_state.payees.contains(&self.user.key()) {
             return err!(CustomError::UnauthorizedPayee);
         }
-
-        // If user is not admin, check epoch limits
+        // If user is not admin, check epoch spending limits
         if self.user.key() != self.vault_state.admin {
             let now = Clock::get()?.unix_timestamp;
-            
             if let Some((_, epoch_spending)) = self.vault_state.epoch_limits
                 .iter_mut()
                 .find(|(p, _)| p == &self.user.key())
             {
-                // Check if we need to reset the epoch
+                // Reset epoch if needed
                 if now >= epoch_spending.epoch_start + epoch_spending.duration {
-                    // New epoch starts
                     epoch_spending.epoch_start = now;
                     epoch_spending.spent_amount = 0;
                 }
-                
-                // Check if this withdrawal would exceed the limit
+                // Check if withdrawal exceeds limit
                 if epoch_spending.spent_amount + amount > epoch_spending.limit {
                     return err!(CustomError::EpochSpendingLimitReached);
                 }
-                
                 // Update spent amount
                 epoch_spending.spent_amount += amount;
             }
         }
-
-        // Perform the withdrawal
+        // Perform the withdrawal from vault to user
         let cpi_program = self.system_program.to_account_info();
         let cpi_accounts = Transfer {
             from: self.vault.to_account_info(),
             to: self.user.to_account_info(),
         };
-
         let vault_state_key = self.vault_state.to_account_info().key;
         let vault_bump = self.vault_state.vault_bump;
-
         let seeds = &[
             b"vault",
             vault_state_key.as_ref(),
             &[vault_bump],
         ];
-
         let signer_seeds = &[&seeds[..]];
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-
         transfer(cpi_ctx, amount)?;
-
         Ok(())
     }
 
+    /// Handler for claiming a scheduled payout (payee only)
     pub fn claim_payout(&mut self) -> Result<()> {
         let user_key = self.user.key();
         require!(self.vault_state.payees.contains(&user_key), CustomError::UnauthorizedPayee);
-
         let current_time = Clock::get()?.unix_timestamp;
-        
-        // Find the active schedule and get its index
+        // Find the active payout schedule
         let schedule_index = self.vault_state.payout_schedules
             .iter()
             .position(|s| s.is_active)
             .ok_or(error!(CustomError::ScheduleNotFound))?;
-
         // Check if it's time for payout
         let schedule = &self.vault_state.payout_schedules[schedule_index];
         require!(current_time >= schedule.next_payout_time, CustomError::PayoutTimeNotReached);
-
-        // Get the amount to transfer
         let amount = schedule.amount;
-
-        // Transfer the scheduled amount
+        // Transfer the scheduled amount from vault to user
         let cpi_program = self.system_program.to_account_info();
         let cpi_accounts = Transfer {
             from: self.vault.to_account_info(),
             to: self.user.to_account_info(),
         };
-
         let vault_state_key = self.vault_state.to_account_info().key;
         let vault_bump = self.vault_state.vault_bump;
-
         let seeds = &[
             b"vault",
             vault_state_key.as_ref(),
             &[vault_bump],
         ];
-
         let signer_seeds = &[&seeds[..]];
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-
         transfer(cpi_ctx, amount)?;
-
-        // Update next payout time after successful transfer
+        // Update next payout time for the schedule
         self.vault_state.payout_schedules[schedule_index].next_payout_time += 
             self.vault_state.payout_schedules[schedule_index].interval;
-
         Ok(())
     }
 }
 
+/// Accounts required for closing the vault
 #[derive(Accounts)]
 pub struct Close<'info> {
     #[account(mut)]
@@ -359,29 +348,26 @@ pub struct Close<'info> {
 }
 
 impl<'info> Close<'info> {
+    /// Handler for closing the vault and returning all funds to the admin
     pub fn close(&mut self) -> Result<()> {
         let cpi_program = self.system_program.to_account_info();
-
         let cpi_accounts = Transfer {
             from: self.vault.to_account_info(),
             to: self.user.to_account_info(),
         };
-
         let seeds = &[
             b"vault",
             self.vault_state.to_account_info().key.as_ref(),
             &[self.vault_state.vault_bump],
         ];
-
         let signer_seeds = &[&seeds[..]];
-
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-
         transfer(cpi_ctx, self.vault.lamports())?;
-
         Ok(())
     }
 }
+
+/// Data structure for a scheduled payout
 #[derive(AnchorDeserialize, AnchorSerialize, Clone, Default)]
 pub struct PayoutSchedule {
     pub amount: u64,                 // Amount to be paid
@@ -390,6 +376,7 @@ pub struct PayoutSchedule {
     pub is_active: bool,             // Whether this schedule is active
 }
 
+/// Data structure for tracking epoch-based spending limits
 #[derive(AnchorDeserialize, AnchorSerialize, Clone, Default)]
 pub struct EpochSpending {
     pub epoch_start: i64,            // Start time of current epoch
@@ -398,6 +385,7 @@ pub struct EpochSpending {
     pub duration: i64,               // Duration of epoch in seconds (e.g., 86400 for daily)
 }
 
+/// Main vault state account
 #[account]
 pub struct VaultState {
     pub vault_bump: u8,
@@ -410,6 +398,7 @@ pub struct VaultState {
 }
 
 impl Space for VaultState {
+    // Calculate the required space for the VaultState account
     // 8 discriminator + 1 vault_bump + 1 state_bump + 32 admin + 
     // 4 vec length + (32 * 5) max payees + 
     // 4 vec length + (8 + 8 + 8 + 1) * 5 max schedules + 
@@ -418,6 +407,7 @@ impl Space for VaultState {
     const INIT_SPACE: usize = 8 + 1 + 1 + 32 + 4 + (32 * 5) + 4 + (25 * 5) + 4 + (64 * 5) + 1;
 }
 
+/// Accounts required for updating payees and payout schedules
 #[derive(Accounts)]
 pub struct UpdatePayee<'info> {
     #[account(mut)]
@@ -432,14 +422,15 @@ pub struct UpdatePayee<'info> {
 }
 
 impl<'info> UpdatePayee<'info> {
+    /// Handler for adding a new payee (admin only)
     pub fn add_payee(&mut self, payee: Pubkey) -> Result<()> {
         require!(self.vault_state.payees.len() < 5, CustomError::MaxPayeesReached);
         require!(!self.vault_state.payees.contains(&payee), CustomError::PayeeAlreadyExists);
-
         self.vault_state.payees.push(payee);
         Ok(())
     }
 
+    /// Handler for removing a payee (admin only)
     pub fn remove_payee(&mut self, payee: Pubkey) -> Result<()> {
         if let Some(index) = self.vault_state.payees.iter().position(|x| *x == payee) {
             self.vault_state.payees.remove(index);
@@ -447,7 +438,6 @@ impl<'info> UpdatePayee<'info> {
             let schedule_index = self.vault_state.payout_schedules
                 .iter()
                 .position(|s| s.is_active);
-            
             if let Some(idx) = schedule_index {
                 self.vault_state.payout_schedules.remove(idx);
             }
@@ -457,6 +447,7 @@ impl<'info> UpdatePayee<'info> {
         }
     }
 
+    /// Handler for scheduling a payout (admin only)
     pub fn schedule_payout(
         &mut self,
         payee: Pubkey,
@@ -470,21 +461,19 @@ impl<'info> UpdatePayee<'info> {
         require!(start_time > Clock::get()?.unix_timestamp, CustomError::InvalidPayoutSchedule);
         require!(self.vault_state.payees.contains(&payee), CustomError::PayeeNotFound);
         require!(self.vault_state.payout_schedules.len() < 5, CustomError::MaxSchedulesReached);
-
         let schedule = PayoutSchedule {
             amount,
             next_payout_time: start_time,
             interval,
             is_active: true,
         };
-
         self.vault_state.payout_schedules.push(schedule);
         Ok(())
     }
 
+    /// Handler for cancelling a payout schedule (admin only)
     pub fn cancel_payout(&mut self, payee: Pubkey) -> Result<()> {
         require!(self.vault_state.payees.contains(&payee), CustomError::PayeeNotFound);
-        
         if let Some(schedule_index) = self.vault_state.payout_schedules.iter().position(|_| true) {
             self.vault_state.payout_schedules[schedule_index].is_active = false;
             Ok(())
