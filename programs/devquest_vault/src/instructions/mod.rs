@@ -1,5 +1,5 @@
 // src/instructions/mod.rs
-// Module exports for instructions
+// Module exports for the instructions
 
 pub mod initialize;
 pub mod deposit;
